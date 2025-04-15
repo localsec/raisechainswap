@@ -717,6 +717,6 @@ screen.key(["C-down"], () => { logsBox.scroll(1); safeRender(); });
 
 safeRender();
 mainMenu.focus();
-addLog("Đừng quên đăng ký kênh YouTube và Telegram @NTExhaust!!", "system");
+addLog("Xin chào các bạn, chúc các bạn một ngày vui vẻ !!! @LocalSec", "system");
 updateLogs();
 updateWalletData();
