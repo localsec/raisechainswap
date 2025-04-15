@@ -260,8 +260,8 @@ const headerBox = blessed.box({
   tags: true,
   style: { fg: "white", bg: "default" }
 });
-figlet.text("NT EXHAUST".toUpperCase(), { font: "Speed", horizontalLayout: "default" }, (err, data) => {
-  if (err) headerBox.setContent("{center}{bold}NT Exhaust{/bold}{/center}");
+figlet.text("LocalSec".toUpperCase(), { font: "Speed", horizontalLayout: "default" }, (err, data) => {
+  if (err) headerBox.setContent("{center}{bold}LocalSec{/bold}{/center}");
   else headerBox.setContent(`{center}{bold}{bright-cyan-fg}${data}{/bright-cyan-fg}{/bold}{/center}`);
   safeRender();
 });
@@ -761,7 +761,7 @@ screen.key(["C-down"], () => { logsBox.scroll(1); safeRender(); });
 
 safeRender();
 mainMenu.focus();
-addLog("Đừng quên đăng ký kênh YouTube và Telegram @NTExhaust!!", "system");
+addLog("Chúc bạn một buổi sáng tốt lành!! @LocalSec", "system");
 updateLogs();
 initializeWallets().then(() => {
   updateWalletData();
