@@ -2,11 +2,18 @@ import "dotenv/config";
 import blessed from "blessed";
 import figlet from "figlet";
 import { ethers } from "ethers";
+import { HttpProxyAgent } from "http-proxy-agent"; // Thêm thư viện hỗ trợ proxy
 
-const RPC_RISE = process.env.RPC_RISE;      
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
+// Lấy danh sách private keys và proxies từ biến môi trường
+const PRIVATE_KEYS = process.env.PRIVATE_KEYS ? process.env.PRIVATE_KEYS.split(",") : [];
+const PROXIES = process.env.PROXIES ? process.env.PROXIES.split(",") : [];
 const WETH_ADDRESS = process.env.WETH_ADDRESS;
 const NETWORK_NAME = "RISE TESTNET";
+
+if (PRIVATE_KEYS.length === 0 || PROXIES.length === 0 || PRIVATE_KEYS.length !== PROXIES.length) {
+  console.error("Cần cung cấp danh sách PRIVATE_KEYS và PROXIES hợp lệ với số lượng bằng nhau.");
+  process.exit(1);
+}
 
 const ERC20ABI = [
   "function decimals() view returns (uint8)",
@@ -22,14 +29,21 @@ const WETH_ABI = [
   "function allowance(address owner, address spender) view returns (uint256)"
 ];
 
-let walletInfo = {
+// Lưu trữ thông tin nhiều ví
+let walletsInfo = PRIVATE_KEYS.map((key, index) => ({
+  privateKey: key,
+  proxy: PROXIES[index],
   address: "",
   balanceNative: "0.00",
   balanceWeth: "0.00",
   network: NETWORK_NAME,
-  status: "Đang khởi tạo"
-};
+  status: "Đang khởi tạo",
+  provider: null,
+  wallet: null,
+  nextNonce: null
+}));
 
+let currentWalletIndex = 0; // Chỉ số ví hiện tại
 let transactionLogs = [];
 let swapRunning = false;
 let swapCancelled = false;
@@ -37,11 +51,9 @@ let gasPumpSwapRunning = false;
 let gasPumpSwapCancelled = false;
 let cloberSwapRunning = false;
 let cloberSwapCancelled = false;
-let globalWallet = null;
 let transactionQueue = Promise.resolve();
 let transactionQueueList = [];
 let transactionIdCounter = 0;
-let nextNonce = null;
 
 function getShortAddress(address) {
   return address.slice(0, 6) + "..." + address.slice(-4);
@@ -55,7 +67,7 @@ function addLog(message, type) {
   let coloredMessage = message;
   if (type === "gaspump") {
     coloredMessage = `{bright-cyan-fg}${message}{/bright-cyan-fg}`;
-  } else if (type === "clober"){
+  } else if (type === "clober") {
     coloredMessage = `{bright-magenta-fg}${message}{/bright-magenta-fg}`;
   } else if (type === "system") {
     coloredMessage = `{bright-white-fg}${message}{/bright-white-fg}`;
@@ -115,13 +127,13 @@ function addTransactionToQueue(transactionFunction, description = "Giao dịch")
     updateTransactionStatus(transactionId, "đang xử lý");
     addLog(`Giao dịch [${transactionId}] bắt đầu được xử lý.`, "system");
     try {
-      if (nextNonce === null) {
-        const provider = new ethers.JsonRpcProvider(RPC_RISE);
-        nextNonce = await provider.getTransactionCount(globalWallet.address, "pending");
-        addLog(`Nonce ban đầu: ${nextNonce}`, "system");
+      const walletInfo = walletsInfo[currentWalletIndex];
+      if (walletInfo.nextNonce === null) {
+        walletInfo.nextNonce = await walletInfo.provider.getTransactionCount(walletInfo.address, "pending");
+        addLog(`Nonce ban đầu ví ${getShortAddress(walletInfo.address)}: ${walletInfo.nextNonce}`, "system");
       }
-      const result = await transactionFunction(nextNonce);
-      nextNonce++;
+      const result = await transactionFunction(walletInfo.nextNonce);
+      walletInfo.nextNonce++;
       updateTransactionStatus(transactionId, "hoàn thành");
       addLog(`Giao dịch [${transactionId}] đã hoàn thành.`, "system");
       return result;
@@ -129,8 +141,8 @@ function addTransactionToQueue(transactionFunction, description = "Giao dịch")
       updateTransactionStatus(transactionId, "lỗi");
       addLog(`Giao dịch [${transactionId}] thất bại: ${error.message}`, "system");
       if (error.message && error.message.toLowerCase().includes("nonce has already been used")) {
-        nextNonce++;
-        addLog(`Nonce đã được tăng vì đã sử dụng. Giá trị nonce mới: ${nextNonce}`, "system");
+        walletsInfo[currentWalletIndex].nextNonce++;
+        addLog(`Nonce ví ${getShortAddress(walletsInfo[currentWalletIndex].address)} tăng lên: ${walletsInfo[currentWalletIndex].nextNonce}`, "system");
       }
       return;
     } finally {
@@ -248,8 +260,8 @@ const headerBox = blessed.box({
   tags: true,
   style: { fg: "white", bg: "default" }
 });
-figlet.text("LocalSec".toUpperCase(), { font: "Speed", horizontalLayout: "default" }, (err, data) => {
-  if (err) headerBox.setContent("{center}{bold}LocalSec{/bold}{/center}");
+figlet.text("NT EXHAUST".toUpperCase(), { font: "Speed", horizontalLayout: "default" }, (err, data) => {
+  if (err) headerBox.setContent("{center}{bold}NT Exhaust{/bold}{/center}");
   else headerBox.setContent(`{center}{bold}{bright-cyan-fg}${data}{/bright-cyan-fg}{/bold}{/center}`);
   safeRender();
 });
@@ -297,7 +309,7 @@ function getSwapMenuItems() {
   if (gasPumpSwapRunning) {
     items.push("Dừng giao dịch");
   }
-  items = items.concat(["Tự động Swap ETH & WETH","{grey-fg}Thêm cặp khác sắp ra mắt{/grey-fg}", "Xóa nhật ký giao dịch", "Quay lại Menu chính", "Làm mới"]);
+  items = items.concat(["Tự động Swap ETH & WETH", "{grey-fg}Thêm cặp khác sắp ra mắt{/grey-fg}", "Xóa nhật ký giao dịch", "Quay lại Menu chính", "Làm mới"]);
   return items;
 }
 
@@ -306,7 +318,7 @@ function getCloberSwapMenuItems() {
   if (cloberSwapRunning) {
     items.push("Dừng giao dịch");
   }
-  items = items.concat(["Tự động Swap ETH & WETH","{grey-fg}Thêm cặp khác sắp ra mắt{/grey-fg}", "Xóa nhật ký giao dịch", "Quay lại Menu chính", "Làm mới"]);
+  items = items.concat(["Tự động Swap ETH & WETH", "{grey-fg}Thêm cặp khác sắp ra mắt{/grey-fg}", "Xóa nhật ký giao dịch", "Quay lại Menu chính", "Làm mới"]);
   return items;
 }
 
@@ -392,24 +404,41 @@ function adjustLayout() {
 screen.on("resize", adjustLayout);
 adjustLayout();
 
+async function initializeWallets() {
+  for (let i = 0; i < walletsInfo.length; i++) {
+    try {
+      const walletInfo = walletsInfo[i];
+      const agent = new HttpProxyAgent(walletInfo.proxy);
+      const provider = new ethers.JsonRpcProvider(process.env.RPC_RISE, undefined, {
+        fetchOptions: { agent }
+      });
+      const wallet = new ethers.Wallet(walletInfo.privateKey, provider);
+      walletInfo.provider = provider;
+      walletInfo.wallet = wallet;
+      walletInfo.address = wallet.address;
+      addLog(`Khởi tạo ví ${getShortAddress(walletInfo.address)} với proxy ${walletInfo.proxy}`, "system");
+    } catch (error) {
+      addLog(`Không thể khởi tạo ví ${i + 1}: ${error.message}`, "error");
+    }
+  }
+}
+
 async function updateWalletData() {
   try {
-    const provider = new ethers.JsonRpcProvider(RPC_RISE);
-    const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-    globalWallet = wallet;
-    walletInfo.address = wallet.address;
-    const nativeBalance = await provider.getBalance(wallet.address);
+    const walletInfo = walletsInfo[currentWalletIndex];
+    const nativeBalance = await walletInfo.provider.getBalance(walletInfo.address);
     walletInfo.balanceNative = ethers.formatEther(nativeBalance);
-    const tokenContract = (address) => new ethers.Contract(address, ERC20ABI, provider);
-    const wethBalance = await tokenContract(WETH_ADDRESS).balanceOf(wallet.address);
+    const tokenContract = new ethers.Contract(WETH_ADDRESS, ERC20ABI, walletInfo.provider);
+    const wethBalance = await tokenContract.balanceOf(walletInfo.address);
     walletInfo.balanceWeth = ethers.formatEther(wethBalance);
     updateWallet();
-    addLog("Số dư & Ví đã được cập nhật !!", "system");
+    addLog(`Số dư ví ${getShortAddress(walletInfo.address)} đã được cập nhật !!`, "system");
   } catch (error) {
-    addLog("Không thể lấy dữ liệu ví: " + error.message, "system");
+    addLog(`Không thể lấy dữ liệu ví ${getShortAddress(walletsInfo[currentWalletIndex].address)}: ${error.message}`, "system");
   }
 }
 function updateWallet() {
+  const walletInfo = walletsInfo[currentWalletIndex];
   const shortAddress = walletInfo.address ? getShortAddress(walletInfo.address) : "N/A";
   const native = walletInfo.balanceNative ? Number(walletInfo.balanceNative).toFixed(4) : "0.0000";
   const weth = walletInfo.balanceWeth ? Number(walletInfo.balanceWeth).toFixed(4) : "0.0000";
@@ -452,73 +481,80 @@ async function runAutoSwapETHWETH() {
     swapSubMenu.show();
     safeRender();
 
-    const provider = new ethers.JsonRpcProvider(RPC_RISE);
-    const wallet = globalWallet || new ethers.Wallet(PRIVATE_KEY, provider);
-    const wethContract = new ethers.Contract(WETH_ADDRESS, WETH_ABI, wallet);
+    // Chạy lần lượt từng ví
+    for (let walletIndex = 0; walletIndex < walletsInfo.length; walletIndex++) {
+      currentWalletIndex = walletIndex;
+      const walletInfo = walletsInfo[currentWalletIndex];
+      addLog(`Bắt đầu xử lý ví ${getShortAddress(walletInfo.address)}`, "system");
+      await updateWalletData();
 
-    let currentState = "ETH"; 
+      const wethContract = new ethers.Contract(WETH_ADDRESS, WETH_ABI, walletInfo.wallet);
+      let currentState = "ETH";
 
-    for (let i = 1; i <= loopCount; i++) {
-      if (gasPumpSwapCancelled) {
-        addLog(`GasPump: Tự động Swap ETH & WETH bị dừng tại vòng ${i}.`, "gaspump");
-        break;
-      }
-      const randomAmount = getRandomNumber(0.0001, 0.001);
-      const amount = ethers.parseEther(randomAmount.toFixed(6));
-
-      await addTransactionToQueue(async (nonce) => {
-        let tx;
-        if (currentState === "ETH") {
-          try {
-            addLog(`GasPump: Thực hiện Swap ${randomAmount.toFixed(6)} ETH ➯ WETH.`, "gaspump");
-            tx = await wethContract.deposit({ value: amount, gasLimit: 100000, nonce: nonce });
-            addLog(`GasPump: Đang gửi giao dịch ... Hash: ${getShortHash(tx.hash)}`, "gaspump");
-            await tx.wait();
-            addLog(`GasPump: Giao dịch thành công!! Hash: ${getShortHash(tx.hash)}`, "success");
-            currentState = "WETH";
-          } catch (error) {
-            addLog(`GasPump: Lỗi ${error.message}`, "error");
-          }
-        } else {
-          try {
-            addLog(`GasPump: Thực hiện Swap ${randomAmount.toFixed(6)} WETH ➯ ETH.`, "gaspump");
-            const currentAllowance = await wethContract.allowance(wallet.address, WETH_ADDRESS);
-            if (currentAllowance < amount) {
-              addLog("GasPump: Giao dịch cần phê duyệt.", "GasPump");
-              const approveTx = await wethContract.approve(WETH_ADDRESS, ethers.MaxUint256, { gasLimit: 100000, nonce: nonce });
-              addLog(`GasPump: Đã gửi phê duyệt.. Hash: ${getShortHash(approveTx.hash)}`, "gaspump");
-              await approveTx.wait();
-              addLog("GasPump: Phê duyệt thành công.", "success");
-            }
-            tx = await wethContract.withdraw(amount, { gasLimit: 100000, nonce: nonce });
-            addLog(`GasPump: Đang gửi giao dịch... Hash: ${getShortHash(tx.hash)}`, "gaspump");
-            await tx.wait();
-            addLog(`GasPump: Giao dịch thành công!! Hash: ${getShortHash(tx.hash)}`, "success");
-            await updateWalletData();
-            currentState = "ETH";
-          } catch (error) {
-            addLog(`Lỗi Swap: ${error.message}`, "error");
-          }
-        }
-      }, `GasPump Swap - Vòng thứ ${i}`);
-
-      if (i < loopCount) {
-        const delayTime = getRandomDelay();
-        const minutes = Math.floor(delayTime / 60000);
-        const seconds = Math.floor((delayTime % 60000) / 1000);
-        addLog(`Swap thứ ${i} hoàn thành. Đang chờ ${minutes} phút ${seconds} giây.`, "gaspump");
-        await waitWithCancel(delayTime, "swap");
+      for (let i = 1; i <= loopCount; i++) {
         if (gasPumpSwapCancelled) {
-          addLog("GasPump Swap: Bị dừng trong thời gian chờ.", "gaspump");
+          addLog(`GasPump: Tự động Swap ETH & WETH bị dừng tại ví ${getShortAddress(walletInfo.address)} vòng ${i}.`, "gaspump");
           break;
         }
+        const randomAmount = getRandomNumber(0.0001, 0.001);
+        const amount = ethers.parseEther(randomAmount.toFixed(6));
+
+        await addTransactionToQueue(async (nonce) => {
+          let tx;
+          if (currentState === "ETH") {
+            try {
+              addLog(`GasPump: Thực hiện Swap ${randomAmount.toFixed(6)} ETH ➯ WETH cho ví ${getShortAddress(walletInfo.address)}.`, "gaspump");
+              tx = await wethContract.deposit({ value: amount, gasLimit: 100000, nonce: nonce });
+              addLog(`GasPump: Đang gửi giao dịch ... Hash: ${getShortHash(tx.hash)}`, "gaspump");
+              await tx.wait();
+              addLog(`GasPump: Giao dịch thành công!! Hash: ${getShortHash(tx.hash)}`, "success");
+              currentState = "WETH";
+            } catch (error) {
+              addLog(`GasPump: Lỗi ví ${getShortAddress(walletInfo.address)}: ${error.message}`, "error");
+            }
+          } else {
+            try {
+              addLog(`GasPump: Thực hiện Swap ${randomAmount.toFixed(6)} WETH ➯ ETH cho ví ${getShortAddress(walletInfo.address)}.`, "gaspump");
+              const currentAllowance = await wethContract.allowance(walletInfo.address, WETH_ADDRESS);
+              if (currentAllowance < amount) {
+                addLog(`GasPump: Giao dịch cần phê duyệt cho ví ${getShortAddress(walletInfo.address)}.`, "gaspump");
+                const approveTx = await wethContract.approve(WETH_ADDRESS, ethers.MaxUint256, { gasLimit: 100000, nonce: nonce });
+                addLog(`GasPump: Đã gửi phê duyệt.. Hash: ${getShortHash(approveTx.hash)}`, "gaspump");
+                await approveTx.wait();
+                addLog(`GasPump: Phê duyệt thành công cho ví ${getShortAddress(walletInfo.address)}.`, "success");
+              }
+              tx = await wethContract.withdraw(amount, { gasLimit: 100000, nonce: nonce });
+              addLog(`GasPump: Đang gửi giao dịch... Hash: ${getShortHash(tx.hash)}`, "gaspump");
+              await tx.wait();
+              addLog(`GasPump: Giao dịch thành công!! Hash: ${getShortHash(tx.hash)}`, "success");
+              await updateWalletData();
+              currentState = "ETH";
+            } catch (error) {
+              addLog(`Lỗi Swap ví ${getShortAddress(walletInfo.address)}: ${error.message}`, "error");
+            }
+          }
+        }, `GasPump Swap - Ví ${getShortAddress(walletInfo.address)} - Vòng thứ ${i}`);
+
+        if (i < loopCount) {
+          const delayTime = getRandomDelay();
+          const minutes = Math.floor(delayTime / 60000);
+          const seconds = Math.floor((delayTime % 60000) / 1000);
+          addLog(`Swap thứ ${i} hoàn thành cho ví ${getShortAddress(walletInfo.address)}. Đang chờ ${minutes} phút ${seconds} giây.`, "gaspump");
+          await waitWithCancel(delayTime, "swap");
+          if (gasPumpSwapCancelled) {
+            addLog(`GasPump Swap: Bị dừng trong thời gian chờ cho ví ${getShortAddress(walletInfo.address)}.`, "gaspump");
+            break;
+          }
+        }
       }
+      if (gasPumpSwapCancelled) break;
     }
+
     gasPumpSwapRunning = false;
     mainMenu.setItems(getMainMenuItems());
     swapSubMenu.setItems(getSwapMenuItems());
     safeRender();
-    addLog("GasPump Swap: Tự động Swap ETH & WETH hoàn tất.", "gaspump");
+    addLog("GasPump Swap: Tự động Swap ETH & WETH hoàn tất cho tất cả ví.", "gaspump");
   });
 }
 
@@ -538,11 +574,6 @@ async function runCloberSwapETHWETH() {
     }
     addLog(`Clober Swap: Bắt đầu ${loopCount} vòng lặp.`, "clober");
 
-    const provider = new ethers.JsonRpcProvider(RPC_RISE);
-    const wallet = globalWallet || new ethers.Wallet(PRIVATE_KEY, provider);
-    const wethContract = new ethers.Contract(WETH_ADDRESS, WETH_ABI, wallet);
-
-    let currentState = "ETH";
     cloberSwapRunning = true;
     cloberSwapCancelled = false;
     mainMenu.setItems(getMainMenuItems());
@@ -550,67 +581,80 @@ async function runCloberSwapETHWETH() {
     cloberSwapSubMenu.show();
     safeRender();
 
-    for (let i = 1; i <= loopCount; i++) {
-      if (cloberSwapCancelled) {
-        addLog(`Clober Swap: Bị dừng tại vòng thứ ${i}.`, "clober");
-        break;
-      }
-      const randomAmount = getRandomNumber(0.0001, 0.001);
-      const amount = ethers.parseEther(randomAmount.toFixed(6));
+    // Chạy lần lượt từng ví
+    for (let walletIndex = 0; walletIndex < walletsInfo.length; walletIndex++) {
+      currentWalletIndex = walletIndex;
+      const walletInfo = walletsInfo[currentWalletIndex];
+      addLog(`Bắt đầu xử lý ví ${getShortAddress(walletInfo.address)}`, "system");
+      await updateWalletData();
 
-      await addTransactionToQueue(async (nonce) => {
-        let tx;
-        if (currentState === "ETH") {
-          try {
-            addLog(`Clober: Thực hiện Swap ${randomAmount.toFixed(6)} ETH ➯ WETH`, "clober");
-            tx = await wethContract.deposit({ value: amount, gasLimit: 100000, nonce: nonce });
-            addLog(`Clober: Đang gửi giao dịch... Hash:${getShortHash(tx.hash)}`, "clober");
-            await tx.wait();
-            addLog("Clober: Giao dịch thành công", "success");
-            currentState = "WETH";
-          } catch (error) {
-            addLog(`Clober: Lỗi ${error.message}`, "error");
-          }
-        } else {
-          try {
-            addLog(`Clober: Thực hiện Swap ${randomAmount.toFixed(6)} WETH ➯ ETH.`, "clober");
-            const currentAllowance = await wethContract.allowance(wallet.address, WETH_ADDRESS);
-            if (currentAllowance < amount) {
-              addLog("Clober: Giao dịch cần phê duyệt", "clober");
-              const approveTx = await wethContract.approve(WETH_ADDRESS, ethers.MaxUint256, { gasLimit: 100000, nonce: nonce });
-              addLog(`Clober: Đã gửi phê duyệt... Hash: ${getShortHash(approveTx.hash)}`, "clober");
-              await approveTx.wait();
-              addLog("Clober: Phê duyệt thành công", "success");
-            }
-            tx = await wethContract.withdraw(amount, { gasLimit: 100000, nonce: nonce });
-            addLog(`Clober: Đang gửi giao dịch... Hash: ${getShortHash(tx.hash)}`, "clober");
-            await tx.wait();
-            addLog("Clober: Giao dịch thành công", "success");
-            await updateWalletData();
-            currentState = "ETH";
-          } catch (error) {
-            addLog(`Lỗi rút tiền (Clober): ${error.message}`, "error");
-          }
-        }
-      }, `Clober Swap - Vòng thứ ${i}`);
+      const wethContract = new ethers.Contract(WETH_ADDRESS, WETH_ABI, walletInfo.wallet);
+      let currentState = "ETH";
 
-      if (i < loopCount) {
-        const delayTime = getRandomDelay();
-        const minutes = Math.floor(delayTime / 60000);
-        const seconds = Math.floor((delayTime % 60000) / 1000);
-        addLog(`Clober Swap: Vòng thứ ${i} hoàn thành. Đang chờ ${minutes} phút ${seconds} giây`, "clober");
-        await waitWithCancel(delayTime, "swap");
+      for (let i = 1; i <= loopCount; i++) {
         if (cloberSwapCancelled) {
-          addLog("Clober Swap: Bị dừng trong thời gian chờ.", "clober");
+          addLog(`Clober Swap: Bị dừng tại ví ${getShortAddress(walletInfo.address)} vòng thứ ${i}.`, "clober");
           break;
         }
+        const randomAmount = getRandomNumber(0.0001, 0.001);
+        const amount = ethers.parseEther(randomAmount.toFixed(6));
+
+        await addTransactionToQueue(async (nonce) => {
+          let tx;
+          if (currentState === "ETH") {
+            try {
+              addLog(`Clober: Thực hiện Swap ${randomAmount.toFixed(6)} ETH ➯ WETH cho ví ${getShortAddress(walletInfo.address)}`, "clober");
+              tx = await wethContract.deposit({ value: amount, gasLimit: 100000, nonce: nonce });
+              addLog(`Clober: Đang gửi giao dịch... Hash:${getShortHash(tx.hash)}`, "clober");
+              await tx.wait();
+              addLog(`Clober: Giao dịch thành công cho ví ${getShortAddress(walletInfo.address)}`, "success");
+              currentState = "WETH";
+            } catch (error) {
+              addLog(`Clober: Lỗi ví ${getShortAddress(walletInfo.address)}: ${error.message}`, "error");
+            }
+          } else {
+            try {
+              addLog(`Clober: Thực hiện Swap ${randomAmount.toFixed(6)} WETH ➯ ETH cho ví ${getShortAddress(walletInfo.address)}.`, "clober");
+              const currentAllowance = await wethContract.allowance(walletInfo.address, WETH_ADDRESS);
+              if (currentAllowance < amount) {
+                addLog(`Clober: Giao dịch cần phê duyệt cho ví ${getShortAddress(walletInfo.address)}`, "clober");
+                const approveTx = await wethContract.approve(WETH_ADDRESS, ethers.MaxUint256, { gasLimit: 100000, nonce: nonce });
+                addLog(`Clober: Đã gửi phê duyệt... Hash: ${getShortHash(approveTx.hash)}`, "clober");
+                await approveTx.wait();
+                addLog(`Clober: Phê duyệt thành công cho ví ${getShortAddress(walletInfo.address)}`, "success");
+              }
+              tx = await wethContract.withdraw(amount, { gasLimit: 100000, nonce: nonce });
+              addLog(`Clober: Đang gửi giao dịch... Hash: ${getShortHash(tx.hash)}`, "clober");
+              await tx.wait();
+              addLog(`Clober: Giao dịch thành công cho ví ${getShortAddress(walletInfo.address)}`, "success");
+              await updateWalletData();
+              currentState = "ETH";
+            } catch (error) {
+              addLog(`Lỗi rút tiền (Clober) ví ${getShortAddress(walletInfo.address)}: ${error.message}`, "error");
+            }
+          }
+        }, `Clober Swap - Ví ${getShortAddress(walletInfo.address)} - Vòng thứ ${i}`);
+
+        if (i < loopCount) {
+          const delayTime = getRandomDelay();
+          const minutes = Math.floor(delayTime / 60000);
+          const seconds = Math.floor((delayTime % 60000) / 1000);
+          addLog(`Clober Swap: Vòng thứ ${i} hoàn thành cho ví ${getShortAddress(walletInfo.address)}. Đang chờ ${minutes} phút ${seconds} giây`, "clober");
+          await waitWithCancel(delayTime, "swap");
+          if (cloberSwapCancelled) {
+            addLog(`Clober Swap: Bị dừng trong thời gian chờ cho ví ${getShortAddress(walletInfo.address)}.`, "clober");
+            break;
+          }
+        }
       }
+      if (cloberSwapCancelled) break;
     }
+
     cloberSwapRunning = false;
     mainMenu.setItems(getMainMenuItems());
     cloberSwapSubMenu.setItems(getCloberSwapMenuItems());
     safeRender();
-    addLog("Clober Swap: Quá trình hoàn tất.", "clober");
+    addLog("Clober Swap: Quá trình hoàn tất cho tất cả ví.", "clober");
   });
 }
 
@@ -717,6 +761,8 @@ screen.key(["C-down"], () => { logsBox.scroll(1); safeRender(); });
 
 safeRender();
 mainMenu.focus();
-addLog("Xin chào các bạn, chúc các bạn một ngày vui vẻ !!! @LocalSec", "system");
+addLog("Đừng quên đăng ký kênh YouTube và Telegram @NTExhaust!!", "system");
 updateLogs();
-updateWalletData();
+initializeWallets().then(() => {
+  updateWalletData();
+});
